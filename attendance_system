@@ -1,0 +1,239 @@
+import cv2
+import os
+import numpy as np
+from PIL import Image
+import csv
+from datetime import date
+
+# ===================== DIRECTORIES =====================
+os.makedirs("dataset", exist_ok=True)
+os.makedirs("trainer", exist_ok=True)
+
+# ===================== FILES =====================
+NAME_ID_FILE = "name_id_map.csv"
+TODAY = date.today().strftime("%Y-%m-%d")
+ATTENDANCE_FILE = f"attendance_{TODAY}.csv"
+
+# ===================== FACE DETECTOR =====================
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+attendance_marked = set()
+
+# ===================== INIT DAILY CSV =====================
+def init_attendance_file():
+    if not os.path.exists(ATTENDANCE_FILE):
+        with open(ATTENDANCE_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Name", "Status"])
+
+# ===================== LOAD NAME-ID MAP =====================
+def load_name_id_map():
+    mapping = {}
+    if os.path.exists(NAME_ID_FILE):
+        with open(NAME_ID_FILE, "r") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                mapping[int(row[0])] = row[1]
+    return mapping
+
+# ===================== SAVE NAME-ID & ATTENDANCE =====================
+def save_name_id(name):
+    init_attendance_file()
+    mapping = load_name_id_map()
+
+    if name in mapping.values():
+        return list(mapping.keys())[list(mapping.values()).index(name)]
+
+    new_id = max(mapping.keys(), default=0) + 1
+
+    with open(NAME_ID_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if new_id == 1:
+            writer.writerow(["ID", "Name"])
+        writer.writerow([new_id, name])
+
+    with open(ATTENDANCE_FILE, "r") as f:
+        existing = [row[0] for row in list(csv.reader(f))[1:]]
+
+    if name not in existing:
+        with open(ATTENDANCE_FILE, "a", newline="") as f:
+            csv.writer(f).writerow([name, "Absent"])
+
+    return new_id
+
+# ===================== CAPTURE FACE DATASET =====================
+def capture_faces():
+    name = input("Enter Student Name: ").strip()
+    face_id = save_name_id(name)
+
+    cam = cv2.VideoCapture(0)
+    cam.set(3, 640)
+    cam.set(4, 480)
+
+    count = 0
+    print("Look at the camera...")
+
+    while True:
+        ret, img = cam.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(
+            gray, scaleFactor=1.3, minNeighbors=5, minSize=(100, 100)
+        )
+
+        for (x, y, w, h) in faces:
+            count += 1
+            cv2.imwrite(
+                f"dataset/User.{face_id}.{count}.jpg",
+                gray[y:y+h, x:x+w]
+            )
+
+            cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(
+                img, f"Images: {count}/50",
+                (x, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (0, 255, 0), 2
+            )
+
+        cv2.imshow("Register Face", img)
+
+        if cv2.waitKey(100) & 0xFF == 27 or count >= 50:
+            break
+
+    cam.release()
+    cv2.destroyAllWindows()
+    print(f"Dataset created for {name}")
+
+# ===================== TRAIN MODEL =====================
+def train_model():
+    paths = [os.path.join("dataset", f) for f in os.listdir("dataset")]
+    if not paths:
+        print("No dataset found!")
+        return
+
+    faces, ids = [], []
+
+    for path in paths:
+        img = Image.open(path).convert("L")
+        img_np = np.array(img, "uint8")
+        face_id = int(path.split(".")[1])
+
+        faces.append(img_np)
+        ids.append(face_id)
+
+    recognizer.train(faces, np.array(ids))
+    recognizer.save("trainer/trainer.yml")
+    print("Model trained successfully!")
+
+# ===================== MARK ATTENDANCE =====================
+def mark_attendance(name):
+    if name in attendance_marked:
+        return False
+
+    updated = False
+
+    with open(ATTENDANCE_FILE, "r") as f:
+        rows = list(csv.reader(f))
+
+    for row in rows[1:]:
+        if row[0] == name and row[1] == "Absent":
+            row[1] = "Present"
+            updated = True
+            attendance_marked.add(name)
+
+    if updated:
+        with open(ATTENDANCE_FILE, "w", newline="") as f:
+            csv.writer(f).writerows(rows)
+
+    return updated
+
+# ===================== TAKE ATTENDANCE =====================
+def take_attendance():
+    if not os.path.exists("trainer/trainer.yml"):
+        print("Train model first!")
+        return
+
+    recognizer.read("trainer/trainer.yml")
+    name_map = load_name_id_map()
+
+    cam = cv2.VideoCapture(0)
+    print("Attendance started... Press ESC to exit")
+
+    while True:
+        ret, img = cam.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+
+        for (x, y, w, h) in faces:
+            face_id, confidence = recognizer.predict(gray[y:y+h, x:x+w])
+
+            if confidence < 70 and face_id in name_map:
+                name = name_map[face_id]
+                marked = mark_attendance(name)
+
+                if marked:
+                    label = f"{name} - Present"
+                    color = (0, 255, 0)
+
+                    cv2.rectangle(img, (x, y), (x+w, y+h), color, 2)
+                    cv2.putText(img, label, (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+                    cv2.imshow("Face Attendance System", img)
+                    cv2.waitKey(1000)
+                    break
+                else:
+                    label = f"{name} - Already Marked"
+                    color = (255, 255, 0)
+            else:
+                label = "Unknown"
+                color = (0, 0, 255)
+
+            cv2.rectangle(img, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(img, label, (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+        cv2.imshow("Face Attendance System", img)
+
+        if cv2.waitKey(10) & 0xFF == 27:
+            break
+
+    cam.release()
+    cv2.destroyAllWindows()
+
+# ===================== MAIN MENU =====================
+def main():
+    init_attendance_file()
+
+    while True:
+        print("\n===== FACE ATTENDANCE SYSTEM =====")
+        print("1. Register Face")
+        print("2. Train Model")
+        print("3. Take Attendance")
+        print("4. Exit")
+
+        choice = input("Enter choice: ")
+
+        if choice == "1":
+            capture_faces()
+        elif choice == "2":
+            train_model()
+        elif choice == "3":
+            take_attendance()
+        elif choice == "4":
+            break
+        else:
+            print("Invalid choice!")
+
+if __name__ == "__main__":
+    main()
